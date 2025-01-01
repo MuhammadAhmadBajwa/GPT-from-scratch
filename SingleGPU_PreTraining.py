@@ -5,6 +5,7 @@ import urllib.request
 import tiktoken
 import os
 import time 
+import math
 
 import tiktoken
 import torch
@@ -250,15 +251,6 @@ def calc_loss_loader(data_loader, model, device, num_batches=None):
     return total_loss / num_batches
 
 
-def evaluate_model(model, train_loader, val_loader, device, eval_iter):
-    model.eval()
-    with torch.no_grad():
-        train_loss = calc_loss_loader(train_loader, model, device, num_batches=eval_iter)
-        val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter)
-    model.train()
-    return train_loss, val_loss
-
-
 def generate_and_print_sample(model, tokenizer, device, start_context):
     model.eval()
     context_size = model.pos_emb.weight.shape[0]
@@ -285,7 +277,7 @@ def get_lr(iteration,max_lr,min_lr,max_steps,warmup_steps):
     return min_lr + coeff * (max_lr - min_lr)
 
 
-def save_checkpoint(model,optimizer,global_step,start_time,file_path='checkpoint.pth'):
+def save_checkpoint(model,optimizer,global_step,prev_time,file_path='checkpoint.pth'):
     print("Saving CheckPoints ...") 
     if os.path.exists("/kaggle/working/checkpoint.pth"):
         os.remove("/kaggle/working/checkpoint.pth")
@@ -296,15 +288,16 @@ def save_checkpoint(model,optimizer,global_step,start_time,file_path='checkpoint
         'optimizer_state_dict': optimizer.state_dict(), # Save Optimizer state
         'step': global_step,  # Current step
         'random_state': torch.random.get_rng_state(),  # Random state for reproducibility
-        'start_time' : start_time
+        'prev_time' : prev_time
     }
     torch.save(checkpoint, file_path)
     print(f"Checkpoint saved at step {global_step} to {file_path}")
     print(50*"=")
     model.train()
 
-def load_checkpoint(model, optimizer, file_path="/kaggle/input/slm-pretraining/checkpoint.pth"):
+def load_checkpoint(model, optimizer, file_path="checkpoint.pth"):
     print("Loading CheckPoints ...")
+    # map_location = torch.device('cuda')
     checkpoint = torch.load(file_path,weights_only=True)
     
     # Restore model state
@@ -316,19 +309,23 @@ def load_checkpoint(model, optimizer, file_path="/kaggle/input/slm-pretraining/c
     torch.random.set_rng_state(checkpoint['random_state'])
     
     step = checkpoint['step']
-    start_time = checkpoint['start_time']
+    prev_time = checkpoint['prev_time']
     print(f"Checkpoint loaded from {file_path}, resuming at step {step}")
-    return step , start_time
+    return step , prev_time
 
 
-def evaluate(model,train_loader,val_loader,eval_iter,global_step,max_steps,start,epoch,device):
-    train_loss, val_loss = evaluate_model(
-        model, train_loader, val_loader, device, eval_iter)
-    print(f"Ep {epoch+1} (Step {global_step:06d}): "
-          f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
-    end = time.time()
-    ETA = (((end-start)/global_step)*(max_steps-global_step))/3600
-    print(f"ETA = {ETA} hours")
+def evaluate(model,train_loader,val_loader,eval_iter,global_step,max_steps,start,epoch,device,prev_time):
+    model.eval()
+    with torch.no_grad():
+        train_loss = calc_loss_loader(train_loader, model, device, num_batches=eval_iter)
+        val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter)
+   
+        print(f"Ep {epoch+1} (Step {global_step:06d}): "
+            f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
+        curr_time = (time.time() - start) + prev_time
+        ETA = ((curr_time/global_step)*(max_steps-global_step))/3600
+        print(f"ETA = {ETA} hours")
+    model.train()
 
 
 def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
@@ -337,31 +334,35 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
     
     global_step = 0
     start = time.time()
-    
+    prev_time = 0
     grad_accum_steps = batch_size//micro_batch_size
     
     max_lr = optimizer.param_groups[0]["lr"]
     min_lr = 0.1 * max_lr
-    max_steps = (len(train_loader)//grad_accum_steps) * num_epochs
+    per_epoch_steps = len(train_loader)//grad_accum_steps
+    max_steps = per_epoch_steps * num_epochs
     warmup_steps = int(0.1 * max_steps)
 
     print(f"Total Steps = {max_steps}")
 
     # Load Checkpoint if exists
     try:
-        global_step , start = load_checkpoint(model, optimizer,checkpoint_path)
+        global_step , prev_time = load_checkpoint(model, optimizer,checkpoint_path)
     except FileNotFoundError:
         print("No checkpoint found, starting from scratch.")
     except :
         print("Starting from scratch, checkpoint didn't match the current architecture")
 
-    
-    
+    curr_epoch = global_step // per_epoch_steps
+    for _ in range((global_step%per_epoch_steps)-1):
+        next(iter(train_loader))
+
     # Main training loop
-    for epoch in range(num_epochs):
+    for epoch in range(num_epochs-curr_epoch):
+        epoch += curr_epoch
         model.train()  # Set model to training mode
         
-        for input_batch, target_batch in train_loader:
+        for _ in range(max_steps//num_epochs):
             
             # optimizer.zero_grad()  # Reset loss gradients from previous batch iteration
             for param in model.parameters():
@@ -369,6 +370,7 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
                 
             # Gradient Accumulation to overcome small batch size problem
             for _ in range(grad_accum_steps):
+                input_batch, target_batch = next(iter(train_loader))
                 loss = calc_loss_batch(input_batch, target_batch, model, device)
                 loss = loss / grad_accum_steps
                 loss.backward()  # Calculate loss gradients
@@ -385,11 +387,12 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
 
             # Optional evaluation step
             if global_step % eval_freq == 0:
-                evaluate(model,train_loader,val_loader,eval_iter,global_step,max_steps,start,epoch,device)
+                evaluate(model,train_loader,val_loader,eval_iter,global_step,max_steps,start,epoch,device,prev_time)
 
             # Save checkpoints
             if global_step % checkpoint_step == 0:
-                save_checkpoint(model,optimizer,global_step,start)
+                curr_time = (time.time() - start) + prev_time
+                save_checkpoint(model,optimizer,global_step,curr_time)
             
                
         # Print a sample text after each epoch
@@ -437,7 +440,8 @@ def main(gpt_config, settings):
 
     model = GPTModel(gpt_config)
     model.to(device)  # no assignment model = model.to(device) necessary for nn.Module classes
-    model = torch.compile(model)   # compile model for efficiency
+
+    # model = torch.compile(model)   # compile model for efficiency (Doesnt work for old gpus)
 
     # Define decayed and non-decayed parameters
     param_optimizer = list(model.named_parameters())
@@ -466,7 +470,7 @@ def main(gpt_config, settings):
         stride=gpt_config["context_length"],
         drop_last=True,
         shuffle=True,
-        num_workers=4
+        num_workers=0
     )
 
     val_loader = create_dataloader_v1(
@@ -476,7 +480,7 @@ def main(gpt_config, settings):
         stride=gpt_config["context_length"],
         drop_last=False,
         shuffle=False,
-        num_workers=4
+        num_workers=0
     )
 
     ##############################
@@ -487,9 +491,9 @@ def main(gpt_config, settings):
 
     train_model_simple(
         model, train_loader, val_loader, optimizer, device,
-        num_epochs=settings["num_epochs"], eval_freq=50, eval_iter=1,
+        num_epochs=settings["num_epochs"], eval_freq=10, eval_iter=1,
         start_context="Every effort moves you", tokenizer=tokenizer,
-        checkpoint_step = 150 , batch_size = settings["batch_size"],
+        checkpoint_step = 20 , batch_size = settings["batch_size"],
         micro_batch_size = settings["micro_batch_size"],
         checkpoint_path=checkpoint_path
     )
@@ -501,10 +505,10 @@ if __name__ == "__main__":
 
     GPT_CONFIG_124M = {
         "vocab_size": 50264,    # Vocabulary size
-        "context_length": 512,  # Shortened context length (orig: 1024)
-        "emb_dim": 1152,         # Embedding dimension
-        "n_heads": 24,          # Number of attention heads
-        "n_layers": 24,         # Number of layers
+        "context_length": 1024,  # Shortened context length (orig: 1024)
+        "emb_dim": 1024,         # Embedding dimension
+        "n_heads": 16,          # Number of attention heads
+        "n_layers": 16,         # Number of layers
         "drop_rate": 0.1,       # Dropout rate
         "qkv_bias": False       # Query-key-value bias
     }
@@ -514,7 +518,7 @@ if __name__ == "__main__":
         "num_epochs": 10,
         "batch_size": 64,
         "weight_decay": 0.1,
-        "micro_batch_size": 4   # Set micro batch according to your gpu memory
+        "micro_batch_size": 2   # Set micro batch according to your gpu memory
     }
 
     ###########################
