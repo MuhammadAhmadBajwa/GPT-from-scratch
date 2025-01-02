@@ -491,7 +491,7 @@ def main(gpt_config, settings):
 
     train_model_simple(
         model, train_loader, val_loader, optimizer, device,
-        num_epochs=settings["num_epochs"], eval_freq=10, eval_iter=1,
+        num_epochs=settings["num_epochs"], eval_freq=10, eval_iter=10,
         start_context="Every effort moves you", tokenizer=tokenizer,
         checkpoint_step = 20 , batch_size = settings["batch_size"],
         micro_batch_size = settings["micro_batch_size"],
