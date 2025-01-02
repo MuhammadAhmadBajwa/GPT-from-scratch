@@ -5,6 +5,7 @@ import urllib.request
 import tiktoken
 import os
 import time 
+import math 
 
 import tiktoken
 import torch
@@ -15,10 +16,12 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group , destroy_process_group
+import torch.distributed as dist
 
 def ddp_setup(rank,world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
+    # init_process_group(backend="nccl", init_method="env://", rank=rank, world_size=world_size)
     init_process_group(backend="nccl",rank=rank,world_size=world_size)
     
 class GPTDatasetV1(Dataset):
@@ -254,24 +257,15 @@ def calc_loss_loader(data_loader, model, device, num_batches=None):
     for i, (input_batch, target_batch) in enumerate(data_loader):
         if i < num_batches:
             loss = calc_loss_batch(input_batch, target_batch, model, device)
-            total_loss += loss.item()
+            total_loss += loss
         else:
             break
     return total_loss / num_batches
 
 
-def evaluate_model(model, train_loader, val_loader, device, eval_iter):
-    model.eval()
-    with torch.no_grad():
-        train_loss = calc_loss_loader(train_loader, model, device, num_batches=eval_iter)
-        val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter)
-    model.train()
-    return train_loss, val_loss
-
-
 def generate_and_print_sample(model, tokenizer, device, start_context):
     model.eval()
-    context_size = model.pos_emb.weight.shape[0]
+    context_size = model.module.pos_emb.weight.shape[0]
     encoded = text_to_token_ids(start_context, tokenizer).to(device)
     with torch.no_grad():
         token_ids = generate_text_simple(
@@ -285,17 +279,21 @@ def generate_and_print_sample(model, tokenizer, device, start_context):
 
 def get_lr(iteration,max_lr,min_lr,max_steps,warmup_steps):
     
-    if iteration < warmup_steps:
-        return max_lr * (iteration+1)/warmup_steps
-    if iteration > max_steps:
-        return min_lr
-    decay_ratio = (iteration-warmup_steps)/(max_steps-warmup_steps)
-    assert 0<=decay_ratio <= 1
-    coeff = 0.5 * (1.0+math.cos(math.pi*decay_ratio))
-    return min_lr + coeff * (max_lr - min_lr)
+    try:
+        if iteration < warmup_steps:
+            return max_lr * (iteration+1)/warmup_steps
+        if iteration > max_steps:
+            return min_lr
+        decay_ratio = (iteration-warmup_steps)/(max_steps-warmup_steps)
+        assert 0<=decay_ratio <= 1
+        coeff = 0.5 * (1.0+math.cos(math.pi*decay_ratio))
+        return min_lr + coeff * (max_lr - min_lr)
+    except:
+        pass
+    
 
 
-def save_checkpoint(model,optimizer,global_step,start_time,file_path='checkpoint.pth'):
+def save_checkpoint(model,optimizer,global_step,total_time,file_path='checkpoint.pth'):
     print("Saving CheckPoints ...") 
     if os.path.exists("/kaggle/working/checkpoint.pth"):
         os.remove("/kaggle/working/checkpoint.pth")
@@ -306,16 +304,17 @@ def save_checkpoint(model,optimizer,global_step,start_time,file_path='checkpoint
         'optimizer_state_dict': optimizer.state_dict(), # Save Optimizer state
         'step': global_step,  # Current step
         'random_state': torch.random.get_rng_state(),  # Random state for reproducibility
-        'start_time' : start_time
+        'total_time' : total_time
     }
     torch.save(checkpoint, file_path)
     print(f"Checkpoint saved at step {global_step} to {file_path}")
     print(50*"=")
     model.train()
 
-def load_checkpoint(model, optimizer, file_path="/kaggle/input/slm-pretraining/checkpoint.pth"):
+def load_checkpoint(model, optimizer, rank,file_path="checkpoint.pth"):
     print("Loading CheckPoints ...")
-    checkpoint = torch.load(file_path,weights_only=True)
+    map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
+    checkpoint = torch.load(file_path, map_location=map_location, weights_only=True)
     
     # Restore model state
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -326,76 +325,99 @@ def load_checkpoint(model, optimizer, file_path="/kaggle/input/slm-pretraining/c
     torch.random.set_rng_state(checkpoint['random_state'])
     
     step = checkpoint['step']
-    start_time = checkpoint['start_time']
+    total_time = checkpoint['total_time']
     print(f"Checkpoint loaded from {file_path}, resuming at step {step}")
-    return step , start_time
+    return step , total_time
 
 
-def evaluate(model,train_loader,val_loader,eval_iter,global_step,max_steps,start,epoch,device):
-    train_loss, val_loss = evaluate_model(
-        model, train_loader, val_loader, device, eval_iter)
-    print(f"Ep {epoch+1} (Step {global_step:06d}): "
-          f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
-    end = time.time()
-    ETA = (((end-start)/global_step)*(max_steps-global_step))/3600
-    print(f"ETA = {ETA} hours")
+def evaluate(model,train_loader,val_loader,eval_iter,global_step,max_steps,start,epoch,device,rank,prev_time):
+    model.eval()
+    with torch.no_grad():
+        train_loss = calc_loss_loader(train_loader, model, device, num_batches=eval_iter)
+        val_loss = calc_loss_loader(val_loader, model, device, num_batches=eval_iter)
+        dist.reduce(train_loss, dst=0, op=dist.ReduceOp.AVG)
+        dist.reduce(val_loss, dst=0, op=dist.ReduceOp.AVG)
+        if rank == 0:
+            print(f"Ep {epoch+1} (Step {global_step:06d}): "
+                f"Train loss {train_loss.item():.3f}, Val loss {val_loss.item():.3f}")
+            end = time.time() + prev_time
+            ETA = (((end-start)/global_step)*(max_steps-global_step))/3600
+            print(f"ETA = {ETA} hours")
+    model.train()
 
 
 def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
                        eval_freq, eval_iter, start_context, tokenizer,checkpoint_step,
-                       batch_size,micro_batch_size,checkpoint_path):
+                       batch_size,micro_batch_size,checkpoint_path,rank,lock):
     
     global_step = 0
     start = time.time()
-    
+    prev_time = 0
     # Load Checkpoint if exists
     try:
-        global_step , start = load_checkpoint(model, optimizer,checkpoint_path)
+        global_step , prev_time = load_checkpoint(model, optimizer,rank,checkpoint_path)
     except FileNotFoundError:
         print("No checkpoint found, starting from scratch.")
     except :
         print("Starting from scratch, checkpoint didn't match the current architecture")
 
     grad_accum_steps = batch_size//micro_batch_size
-    
+
     max_lr = optimizer.param_groups[0]["lr"]
     min_lr = 0.1 * max_lr
-    max_steps = (len(train_loader)//grad_accum_steps) * num_epochs
+    per_epoch_steps = len(train_loader)//grad_accum_steps
+    max_steps = per_epoch_steps * num_epochs
     warmup_steps = int(0.1 * max_steps)
-    if device == torch.device('cuda:0'):
+    
+    
+    curr_epoch = global_step // per_epoch_steps
+    for _ in range(global_step%per_epoch_steps):
+        next(iter(train_loader))
+
+    if rank == 0:
       print(f"Total Steps = {max_steps}")
+    
 
     
     # Main training loop
     for epoch in range(num_epochs):
         model.train()  # Set model to training mode
-        for input_batch, target_batch in train_loader:
-            # optimizer.zero_grad()  # Reset loss gradients from previous batch iteration
-            for param in model.parameters():
-                 param.grad = None
+        for i,batch in enumerate(train_loader):
+            input_batch , target_batch = batch
+
             # Gradient Accumulation to overcome small batch size problem
-            for _ in range(grad_accum_steps):
-                loss = calc_loss_batch(input_batch, target_batch, model, device)
-                loss = loss / grad_accum_steps
-                loss.backward()  # Calculate loss gradients
-              
-            # Learning Rate Update 
-            lr = get_lr(global_step,max_lr,min_lr,max_steps,warmup_steps)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
-               
-            torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)   # Gradient Clipping
+            # No synchronization during Gradient Accumulation
+            loss = calc_loss_batch(input_batch, target_batch, model, device)
+            loss = loss / grad_accum_steps
+            model.require_backward_grad_sync = ((i % grad_accum_steps) == grad_accum_steps-1)
+            loss.backward()  # Calculate loss gradients
+
+
             
-            optimizer.step()  # Update model weights using loss gradients
-            global_step += 1
+            if i % grad_accum_steps == 0:
+                # Learning Rate Update 
+                lr = get_lr(global_step,max_lr,min_lr,max_steps,warmup_steps)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr
+                
+                torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)   # Gradient Clipping
+                optimizer.step()  # Update model weights using loss gradients
+
+                # optimizer.zero_grad()  # Reset loss gradients from previous batch iteration
+                for param in model.parameters():
+                    param.grad = None
+                    
+                global_step += 1
+                
 
             # Optional evaluation step
-            if device == torch.device('cuda:0') and global_step % eval_freq == 0:
-                evaluate(model,train_loader,val_loader,eval_iter,global_step,max_steps,start,epoch,device)
+            if  global_step % eval_freq == 0:
+                evaluate(model,train_loader,val_loader,eval_iter,global_step,max_steps,start,epoch,device,rank,prev_time)
 
             # Save checkpoints
-            if device == torch.device('cuda:0') and global_step % checkpoint_step == 0:
-                save_checkpoint(model,optimizer,global_step,start)
+            if rank == 0 and global_step % checkpoint_step == 0:
+                total_time = (time.time() - start) + prev_time
+                save_checkpoint(model,optimizer,global_step,total_time)
             
                
         # Print a sample text after each epoch
@@ -424,7 +446,7 @@ def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
     # plt.show()
 
     
-def main(rank,world_size,gpt_config, settings):
+def main(rank,world_size,lock,gpt_config, settings):
     ddp_setup(rank,world_size)
     torch.manual_seed(123)
     device = torch.device(f'cuda:{rank}')
@@ -441,16 +463,16 @@ def main(rank,world_size,gpt_config, settings):
     ##############################
     # Initialize model
     ##############################
-
+    
     model = GPTModel(gpt_config)
     model.to(device)  # no assignment model = model.to(device) necessary for nn.Module classes
-    model = torch.compile(model)   # compile model for efficiency
+    with lock:
+        model = torch.compile(model)   # compile model for efficiency
     model = DDP(model,device_ids=[rank])
-    model = model.module
 
 
     # Define decayed and non-decayed parameters
-    param_optimizer = list(model.named_parameters())
+    param_optimizer = list(model.module.named_parameters())
     no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
     optimizer_parameters = [
         {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': settings["weight_decay"]},
@@ -499,9 +521,9 @@ def main(rank,world_size,gpt_config, settings):
         model, train_loader, val_loader, optimizer, device,
         num_epochs=settings["num_epochs"], eval_freq=50, eval_iter=1,
         start_context="Every effort moves you", tokenizer=tokenizer,
-        checkpoint_step = 150 , batch_size = settings["batch_size"],
+        checkpoint_step = 100 , batch_size = settings["batch_size"],
         micro_batch_size = settings["micro_batch_size"],
-        checkpoint_path=checkpoint_path
+        checkpoint_path=checkpoint_path , rank = rank, lock=lock
     )
     dist.barrier()
     destroy_process_group()
@@ -511,10 +533,10 @@ if __name__ == "__main__":
 
     GPT_CONFIG_375M = {
         "vocab_size": 50264,    # Vocabulary size
-        "context_length": 512,  # Shortened context length (orig: 1024)
-        "emb_dim": 1152,         # Embedding dimension
-        "n_heads": 24,          # Number of attention heads
-        "n_layers": 24,         # Number of layers
+        "context_length": 1024,  # Shortened context length (orig: 1024)
+        "emb_dim": 1024,         # Embedding dimension
+        "n_heads": 16,          # Number of attention heads
+        "n_layers": 16,         # Number of layers
         "drop_rate": 0.1,       # Dropout rate
         "qkv_bias": False       # Query-key-value bias
     }
@@ -530,5 +552,5 @@ if __name__ == "__main__":
     ###########################
     # Initiate training
     ###########################
-    mp.spawn(main,args=(world_size,GPT_CONFIG_375M,OTHER_SETTINGS),nprocs=world_size)
-    # model = main(GPT_CONFIG_124M, OTHER_SETTINGS)
+    lock = mp.Manager().Lock()
+    mp.spawn(main,args=(world_size,lock,GPT_CONFIG_375M,OTHER_SETTINGS,),nprocs=world_size)
