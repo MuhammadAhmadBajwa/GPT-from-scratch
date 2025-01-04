@@ -387,8 +387,7 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
 
             # Gradient Accumulation to overcome small batch size problem
             # No synchronization during Gradient Accumulation
-            loss = calc_loss_batch(input_batch, target_batch, model, device)
-            loss = loss / grad_accum_steps
+            loss = calc_loss_batch(input_batch, target_batch, model, device) / grad_accum_steps
             model.require_backward_grad_sync = ((i % grad_accum_steps) == grad_accum_steps-1)
             loss.backward()  # Calculate loss gradients
 
@@ -411,11 +410,11 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
                 
 
             # Optional evaluation step
-            if  global_step % eval_freq == 0:
+            if  i % eval_freq == 0:
                 evaluate(model,train_loader,val_loader,eval_iter,global_step,max_steps,start,epoch,device,rank,prev_time)
 
             # Save checkpoints
-            if rank == 0 and global_step % checkpoint_step == 0:
+            if rank == 0 and i % checkpoint_step == 0:
                 total_time = (time.time() - start) + prev_time
                 save_checkpoint(model,optimizer,global_step,total_time)
             
