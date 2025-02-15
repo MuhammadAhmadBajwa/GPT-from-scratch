@@ -11,6 +11,7 @@ import tiktoken
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import threading
 
 
 class GPTDatasetV1(Dataset):
@@ -277,25 +278,27 @@ def get_lr(iteration,max_lr,min_lr,max_steps,warmup_steps):
     return min_lr + coeff * (max_lr - min_lr)
 
 
-def save_checkpoint(model,optimizer,global_step,prev_time,file_path='checkpoint.pth'):
-    print("Saving CheckPoints ...") 
-    if os.path.exists("/kaggle/working/checkpoint.pth"):
-        os.remove("/kaggle/working/checkpoint.pth")
-    
-    model.eval()
-    checkpoint = {
-        'model_state_dict': model.state_dict()   ,      # Save Model state
-        'optimizer_state_dict': optimizer.state_dict(), # Save Optimizer state
-        'step': global_step,  # Current step
-        'random_state': torch.random.get_rng_state(),  # Random state for reproducibility
-        'prev_time' : prev_time
-    }
-    torch.save(checkpoint, file_path)
-    print(f"Checkpoint saved at step {global_step} to {file_path}")
-    print(50*"=")
-    model.train()
+def save_checkpoint(model,optimizer,global_step,prev_time,file_path='checkpoint.pt'):
+    def save():
+        print("Saving CheckPoints ...") 
+        if os.path.exists("checkpoint.pt"):
+            os.remove("checkpoint.pt")
+        
+        model.eval()
+        checkpoint = {
+            'model_state_dict': model.state_dict()   ,      # Save Model state
+            'optimizer_state_dict': optimizer.state_dict(), # Save Optimizer state
+            'step': global_step,  # Current step
+            'random_state': torch.random.get_rng_state(),  # Random state for reproducibility
+            'prev_time' : prev_time
+        }
+        torch.save(checkpoint, file_path)
+        print(f"Checkpoint saved at step {global_step} to {file_path}")
+        print(50*"=")
+        model.train()
+    threading.Thread(target=save).start()
 
-def load_checkpoint(model, optimizer, file_path="checkpoint.pth"):
+def load_checkpoint(model, optimizer, file_path="checkpoint.pt"):
     print("Loading CheckPoints ...")
     # map_location = torch.device('cuda')
     checkpoint = torch.load(file_path,weights_only=True)
@@ -425,12 +428,12 @@ def main(gpt_config, settings):
 
     torch.manual_seed(123)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint_path = 'checkpoint.pth'
+    checkpoint_path = 'checkpoint.pt'
     ##############################
     # Download data if necessary
     ##############################
 
-    file_path = "/kaggle/input/plain-text-wikipedia-simpleenglish/AllCombined.txt"
+    file_path = "AllCombined.txt"
     with open(file_path, "r", encoding="utf-8") as file:
         text_data = file.read()
 
